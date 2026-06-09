@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Download daily AWS weather rows from KMA APIHub hourly statistics.
+"""
+Download daily AWS weather rows from KMA APIHub hourly statistics.
+The script calls awsh.php 24 times per variable and aggregates the result into hanwoo_weather-compatible daily rows:
 
-The script calls awsh.php 24 times per variable and aggregates the result into
-hanwoo_weather-compatible daily rows:
-
-  stn,date,ta_max,rn_day,ta_min,rhm_avg,ws_davg
+    stn,date,ta_max,rn_day,ta_min,rhm_avg,ws_davg
 
 Example:
-    python3 AWS_weather_downloader.py --date 2023-03-11 --stn 741
-    
     STNS=$(awk '/^[0-9]+\\par$/ {gsub(/\\par/,""); print}' weather_stn.rtf | sort -n | paste -sd, -)
     
     python3 AWS_weather_downloader.py \
@@ -54,17 +51,7 @@ OUTPUT_COLUMNS = [
 MISSING_VALUE = -99.0
 
 # Optional hard-coded API key. Fill this if you do not want to pass --auth-key.
-HARD_CODED_AUTH_KEY = "Ibc0Prd-StW3ND63fvrV5w"
-
-"""
-정재: MZW4XAYpRj6VuFwGKfY-NQ # 
-해인: Tpcm_qzNTp-XJv6szY6ffw # 
-규한: Ibc0Prd-StW3ND63fvrV5w # 
-엄마: kYYxEgQoQc2GMRIEKEHNeg # 
-아빠: cNMk0ijmTR6TJNIo5v0ehw # 
-정민: HshbIqZDQwGIWyKmQ5MBBw # 
-"""
-
+HARD_CODED_AUTH_KEY = ""
 
 @dataclass(frozen=True)
 class Config:
