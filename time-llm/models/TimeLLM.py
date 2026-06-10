@@ -41,7 +41,9 @@ GPT2_VARIANTS = {
 
 
 class FlattenHead(nn.Module):
-    """LLM 출력(패치별 hidden state)을 평탄화한 뒤 선형층으로 예측 길이만큼 투영하는 출력 헤드."""
+    """
+    LLM 출력(patch별 hidden state)를 flatten시키고 FC에 예측 길이만큼 프로젝션 함.
+    """
 
     def __init__(self, n_vars, nf, target_window, head_dropout=0):
         super().__init__()
@@ -64,8 +66,6 @@ class ReprogrammingLayer(nn.Module):
     멀티헤드 cross-attention으로 동작한다.
       - Query  : 시계열 패치 임베딩 (target_embedding)
       - Key/Value : LLM 단어 임베딩에서 추출한 "텍스트 프로토타입" (source/value_embedding)
-    즉, 각 시계열 패치를 텍스트 프로토타입들의 가중합으로 다시 표현하여
-    시계열 모달리티를 언어 모달리티 공간에 정렬시킨다.
     """
 
     def __init__(self, d_model, n_heads, d_keys=None, d_llm=None, attention_dropout=0.1):
@@ -73,16 +73,16 @@ class ReprogrammingLayer(nn.Module):
 
         d_keys = d_keys or (d_model // n_heads)
 
-        self.query_projection = nn.Linear(d_model, d_keys * n_heads)  # 패치 -> Query
-        self.key_projection = nn.Linear(d_llm, d_keys * n_heads)      # 프로토타입 -> Key
-        self.value_projection = nn.Linear(d_llm, d_keys * n_heads)    # 프로토타입 -> Value
-        self.out_projection = nn.Linear(d_keys * n_heads, d_llm)      # 결과 -> LLM 차원으로 복원
-        self.n_heads = n_heads
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads) # 패치 -> Query
+        self.key_projection = nn.Linear(d_llm, d_keys * n_heads) # 프로토타입 -> Key
+        self.value_projection = nn.Linear(d_llm, d_keys * n_heads) # 프로토타입 -> Value
+        self.out_projection = nn.Linear(d_keys * n_heads, d_llm) # 결과 -> LLM 차원으로 복원
+        self.n_heads = n_heads # attention head의 수
         self.dropout = nn.Dropout(attention_dropout)
 
     def forward(self, target_embedding, source_embedding, value_embedding):
-        B, L, _ = target_embedding.shape   # B:배치, L:패치 개수
-        S, _ = source_embedding.shape      # S:프로토타입 개수
+        B, L, _ = target_embedding.shape # B:배치(배치 크기 × 시계열 변수 개수), L:패치 개수
+        S, _ = source_embedding.shape  # S:프로토타입 개수 (프로토타입 임베딩 단어수 디폴트 1000)
         H = self.n_heads
 
         # 각 입력을 (헤드 수 H)로 분할
@@ -93,33 +93,33 @@ class ReprogrammingLayer(nn.Module):
         out = self.reprogramming(target_embedding, source_embedding, value_embedding)
 
         out = out.reshape(B, L, -1)        # 헤드 결합
+        
         return self.out_projection(out)    # LLM 차원(d_llm)으로 투영
 
     def reprogramming(self, target_embedding, source_embedding, value_embedding):
         B, L, H, E = target_embedding.shape
 
-        scale = 1. / sqrt(E)  # 스케일드 닷-프로덕트 어텐션의 스케일 계수
+        scale = 1. / sqrt(E)  # scaled dot-prodcut 어텐션의 스케일 계수
 
-        # 패치(Query)와 프로토타입(Key) 사이의 어텐션 점수 계산
-        scores = torch.einsum("blhe,she->bhls", target_embedding, source_embedding)
+        scores = torch.einsum("blhe,she->bhls", target_embedding, source_embedding) # 패치(Query)와 프로토타입(Key) 사이의 어텐션 점수 계산
 
-        # softmax로 정규화한 어텐션 가중치
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
-
-        # 가중치로 Value(프로토타입)를 가중합 -> 재프로그래밍된 패치 표현
-        reprogramming_embedding = torch.einsum("bhls,she->blhe", A, value_embedding)
+        A = self.dropout(torch.softmax(scale * scores, dim=-1)) # softmax로 정규화한 어텐션 가중치
+        
+        reprogramming_embedding = torch.einsum("bhls,she->blhe", A, value_embedding) # 가중치로 Value(프로토타입)를 가중합 -> 재프로그래밍된 패치 표현
 
         return reprogramming_embedding
 
 
 class Model(nn.Module):
-    """Time-LLM 백본."""
+    """
+    Time-LLM 백본
+    """
 
     def __init__(self, configs, patch_len=16, stride=8):
         super(Model, self).__init__()
         self.task_name = configs.task_name
-        self.pred_len = configs.pred_len     # 예측 길이 (예: 96)
-        self.seq_len = configs.seq_len       # 입력 길이 (예: 512)
+        self.pred_len = configs.pred_len # 예측 길이 (예: 96)
+        self.seq_len = configs.seq_len # 입력 길이 (예: 512)
         self.d_ff = configs.d_ff             # LLM 출력에서 잘라 쓸 특징 차원
         self.top_k = 5                       # 입력 통계 중 자기상관 lag 상위 k개
         self.d_llm = configs.llm_dim         # 초기값. 백본 로드 후 config.hidden_size로 자동 갱신됨
@@ -141,8 +141,7 @@ class Model(nn.Module):
             # (켜면 모든 레이어의 어텐션 행렬이 메모리에 쌓여 단일 GPU에서 OOM 발생)
             self.llm_config.output_attentions = False
             self.llm_config.output_hidden_states = False
-            self.llm_model = self._load_pretrained(
-                LlamaModel, 'huggyllama/llama-7b', self.llm_config)
+            self.llm_model = self._load_pretrained(LlamaModel, 'huggyllama/llama-7b', self.llm_config)
             self.tokenizer = self._load_tokenizer(LlamaTokenizer, 'huggyllama/llama-7b')
 
         elif configs.llm_model == 'GPT2':
@@ -184,7 +183,7 @@ class Model(nn.Module):
         for param in self.llm_model.parameters():
             param.requires_grad = False
 
-        # Gradient checkpointing: 역전파 시 중간 활성값을 저장하지 않고 재계산하여 메모리를 크게 절약.
+        # Gradient checkpointing: 역전파 시 중간 활성값을 저장하지 않고 재계산하여 메모리를 크게 절약. 
         # (속도는 다소 느려지지만, 전체 32-layer LLaMA-7B를 단일 24GB GPU에 올릴 수 있게 해준다.)
         # 입력 임베딩(재프로그래밍 결과)이 grad를 요구하므로 동결 백본이어도 정상 동작한다.
         if getattr(configs, 'gradient_checkpointing', False):
@@ -201,8 +200,7 @@ class Model(nn.Module):
 
         # ---------------------- 학습되는 모듈들 ----------------------
         # 1) 패치 임베딩: 시계열 패치 -> d_model 차원 임베딩
-        self.patch_embedding = PatchEmbedding(
-            configs.d_model, self.patch_len, self.stride, configs.dropout)
+        self.patch_embedding = PatchEmbedding(configs.d_model, self.patch_len, self.stride, configs.dropout)
 
         # 2) 텍스트 프로토타입: LLM의 거대한 단어 임베딩(vocab_size개)을 num_tokens개로 압축
         #    word_embeddings 자체는 동결된 LLM의 것이지만, mapping_layer는 학습된다.
@@ -212,8 +210,7 @@ class Model(nn.Module):
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
 
         # 3) 패치 재프로그래밍 레이어
-        self.reprogramming_layer = ReprogrammingLayer(
-            configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
+        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
 
         # 패치 개수 계산: (입력길이 - 패치길이)/stride + 2  (+1은 마지막 패딩 패치)
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
@@ -266,7 +263,7 @@ class Model(nn.Module):
         min_values = torch.min(x_enc, dim=1)[0]
         max_values = torch.max(x_enc, dim=1)[0]
         medians = torch.median(x_enc, dim=1).values
-        lags = self.calcute_lags(x_enc)            # 자기상관 기반 상위 lag
+        lags = self.calcute_lags(x_enc) # autocorrelation 기반 상위 lag; 시계열 데이터 통계값 추출
         trends = x_enc.diff(dim=1).sum(dim=1)      # 전체 추세 방향(증가/감소)
 
         # ---- 3) 자연어 프롬프트 구성 (채널마다 하나씩) ----
@@ -293,14 +290,12 @@ class Model(nn.Module):
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
 
         # ---- 4) 프롬프트 토크나이즈 -> LLM 임베딩 ----
-        prompt = self.tokenizer(prompt, return_tensors="pt", padding=True,
-                                truncation=True, max_length=2048).input_ids
+        prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
 
         # ---- 5) 텍스트 프로토타입 생성 ----
         # word_embeddings(동결, fp16) -> float로 올린 뒤 mapping_layer로 압축
-        source_embeddings = self.mapping_layer(
-            self.word_embeddings.permute(1, 0).float()).permute(1, 0)
+        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0).float()).permute(1, 0)
 
         # ---- 6) 패치 임베딩 + 재프로그래밍 ----
         x_enc = x_enc.permute(0, 2, 1).contiguous()           # (B*N, 1, T)
@@ -326,14 +321,22 @@ class Model(nn.Module):
 
         # ---- 9) RevIN 역정규화 ----
         dec_out = self.normalize_layers(dec_out, 'denorm')
+        
         return dec_out
 
     def calcute_lags(self, x_enc):
         """FFT 기반 자기상관(autocorrelation)으로 상위 top_k lag를 구한다."""
-        q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
+        q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1) # 시계열 데이터를 주파수 도메인으로 변경
         k_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
         res = q_fft * torch.conj(k_fft)           # 파워 스펙트럼
         corr = torch.fft.irfft(res, dim=-1)       # 역FFT -> 자기상관
         mean_value = torch.mean(corr, dim=1)
-        _, lags = torch.topk(mean_value, self.top_k, dim=-1)
+
+        # lag=0은 시계열을 자기 자신과 비교하므로 실제 지연 주기 후보에서 제외한다.
+        available_lags = mean_value.shape[-1] - 1
+        if available_lags < self.top_k:
+            raise ValueError(f"입력 길이({mean_value.shape[-1]})가 top_k={self.top_k}개의 0이 아닌 lag를 선택하기에 너무 짧습니다.")
+        _, lags = torch.topk(mean_value[..., 1:], self.top_k, dim=-1)
+        lags = lags + 1
+        
         return lags

@@ -5,9 +5,9 @@ import torch.nn as nn
 from torch import Tensor
 import math
 
-
+"""
 class PositionalEmbedding(nn.Module):
-    """사인/코사인 기반 고정 위치 임베딩."""
+    # 사인/코사인 기반 고정 위치 임베딩.
 
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
@@ -15,8 +15,7 @@ class PositionalEmbedding(nn.Module):
         pe.require_grad = False
 
         position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float()
-                    * -(math.log(10000.0) / d_model)).exp()
+        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -26,17 +25,16 @@ class PositionalEmbedding(nn.Module):
 
     def forward(self, x):
         return self.pe[:, :x.size(1)]
-
+"""
 
 class TokenEmbedding(nn.Module):
     """1D 컨볼루션으로 값을 d_model 차원으로 임베딩. (패치 임베딩의 핵심 연산)"""
 
     def __init__(self, c_in, d_model):
-        super(TokenEmbedding, self).__init__()
+        super(TokenEmbedding, self).__init__() # pytroch 가 하위 레이어를 등록하도록 하기 위해 nn.Module 호출
         padding = 1 if torch.__version__ >= '1.5.0' else 2
         # circular 패딩 + 커널3 Conv1d로 지역 패턴을 d_model 차원으로 인코딩
-        self.tokenConv = nn.Conv1d(in_channels=c_in, out_channels=d_model,
-                                   kernel_size=3, padding=padding, padding_mode='circular', bias=False)
+        self.tokenConv = nn.Conv1d(in_channels=c_in, out_channels=d_model, kernel_size=3, padding=padding, padding_mode='circular', bias=False)
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
@@ -44,11 +42,23 @@ class TokenEmbedding(nn.Module):
     def forward(self, x):
         # (B, L, c_in) -> (B, c_in, L) -> Conv1d -> (B, L, d_model)
         x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
+        
         return x
 
-
+"""
 class TimeFeatureEmbedding(nn.Module):
-    """연속 시간 특성(timeF)을 선형층으로 d_model 차원에 매핑."""
+
+    # 연속 시간 특성(timeF)을 선형층으로 d_model 차원에 매핑.
+    #   freq_map = {
+    #   'h': 4,  # hourly
+    #   't': 5,  # minutely
+    #   's': 6,  # secondly
+    #   'm': 1,  # monthly
+    #   'a': 1,  # annual
+    #   'w': 2,  # weekly
+    #   'd': 3,  # daily
+    #   'b': 3   # business day
+    # }
 
     def __init__(self, d_model, embed_type='timeF', freq='h'):
         super(TimeFeatureEmbedding, self).__init__()
@@ -58,7 +68,7 @@ class TimeFeatureEmbedding(nn.Module):
 
     def forward(self, x):
         return self.embed(x)
-
+"""
 
 class ReplicationPad1d(nn.Module):
     """시퀀스 끝 값을 복제하여 오른쪽에 패딩. (마지막 패치를 만들기 위함)"""
