@@ -4,34 +4,49 @@ import numpy as np
 import torch
 import shutil
 from tqdm import tqdm
+import logging
+from transformers import get_scheduler
 
+def build_lr_scheduler(optimizer, train_steps, args):
+    total_steps = train_steps * args.train_epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
 
-def adjust_learning_rate(accelerator, optimizer, scheduler, epoch, args, printout=True):
-    """에폭에 따라 학습률을 조절한다. lradj 방식별로 스케줄이 다르다."""
-    if args.lradj == 'type1':
-        # 매 에폭마다 절반으로 감소
-        lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
-    elif args.lradj == 'type2':
-        lr_adjust = {2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6, 10: 5e-7, 15: 1e-7, 20: 5e-8}
-    elif args.lradj == 'type3':
-        lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
-    elif args.lradj == 'PEMS':
-        lr_adjust = {epoch: args.learning_rate * (0.95 ** (epoch // 1))}
-    elif args.lradj == 'TST':
-        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
-    elif args.lradj == 'COS':
-        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
-    elif args.lradj == 'constant':
-        lr_adjust = {epoch: args.learning_rate}
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        if printout:
-            if accelerator is not None:
-                accelerator.print('Updating learning rate to {}'.format(lr))
-            else:
-                print('Updating learning rate to {}'.format(lr))
+    if args.lradj == 'constant':
+        return get_scheduler(name='constant', optimizer=optimizer)
+
+    scheduler_name = {'linear_with_warmup': 'linear', 'cosine_with_warmup': 'cosine'}[args.lradj]
+    
+    return get_scheduler(name=scheduler_name, optimizer=optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+
+class TrainingLogger:
+      def __init__(self, accelerator, log_path, name='hanwoo_training'):
+          self.accelerator = accelerator
+          self.logger = self.create_logger(log_path, name)
+    
+      def create_logger(self, log_path, name):
+          if not self.accelerator.is_main_process:
+              return None
+
+          logger = logging.getLogger(name)
+          logger.setLevel(logging.INFO)
+          logger.propagate = False
+
+          # 같은 프로세스에서 재생성할 때 handler 중복 방지
+          logger.handlers.clear()
+
+          formatter = logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S')
+
+          file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+          file_handler.setFormatter(formatter)
+          logger.addHandler(file_handler)
+
+          return logger
+
+      def log(self, message):
+          self.accelerator.print(message)
+
+          if self.logger is not None:
+              self.logger.info(message)
 
 
 class EarlyStopping:
@@ -144,3 +159,80 @@ def load_content(args):
     with open('./dataset/prompt_bank/{0}.txt'.format(file), 'r') as f:
         content = f.read()
     return content
+
+
+# ============================ 한우 분류(2-head) 보조 ============================
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 육량/육질 정수 인덱스 -> 등급 문자열 (LAST_GRADE 복원용). Dataset_hanwoo.*_MAP의 역.
+YIELD_INV = {0: 'A', 1: 'B', 2: 'C'}
+QUALITY_INV = {0: '1++', 1: '1+', 2: '1', 3: '2', 4: '3'}
+
+
+class FocalLoss(nn.Module):
+    """다중분류 focal loss (선택적 클래스 가중치 weight 결합)."""
+
+    def __init__(self, gamma=2.0, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, logits, target):
+        ce = F.cross_entropy(logits, target, weight=self.weight, reduction='none')
+        p = torch.exp(-ce)                       # 정답 클래스 확률
+        return ((1 - p) ** self.gamma * ce).mean()
+
+
+def build_cls_criterion(loss_type, weight=None, gamma=2.0):
+    """분류 손실 생성: ce / balanced_ce(weight) / focal."""
+    if loss_type == 'focal':
+        return FocalLoss(gamma=gamma, weight=weight)
+    if loss_type == 'balanced_ce':
+        return nn.CrossEntropyLoss(weight=weight)
+    return nn.CrossEntropyLoss()
+
+
+def combine_last_grade(yld_idx, qual_idx):
+    """(육량idx, 육질idx) -> LAST_GRADE 문자열 리스트 (예: 0,0 -> '1++A')."""
+    return [QUALITY_INV[int(q)] + YIELD_INV[int(y)] for y, q in zip(yld_idx, qual_idx)]
+
+
+@torch.no_grad()
+def vali_cls(accelerator, model, vali_loader, criterion_y, criterion_q):
+    """분류 검증: 손실 + yield/quality/final 지표(micro/macro F1, QWK) 산출."""
+    from sklearn.metrics import f1_score, cohen_kappa_score
+    model.eval()
+    losses, ys, ps_y, qs, ps_q = [], [], [], [], []
+    for batch in tqdm(vali_loader):
+        ts = batch['time_series'].float().to(accelerator.device)
+        mask = batch['mask'].to(accelerator.device)
+        yq = batch['y_yield'].to(accelerator.device)
+        qq = batch['y_quality'].to(accelerator.device)
+        logit_y, logit_q = model(ts, batch['prompt'], mask)
+        loss = criterion_y(logit_y, yq) + criterion_q(logit_q, qq)
+        losses.append(loss.item())
+        ys.append(yq.cpu()); ps_y.append(logit_y.argmax(-1).cpu())
+        qs.append(qq.cpu()); ps_q.append(logit_q.argmax(-1).cpu())
+    model.train()
+
+    ys = torch.cat(ys).numpy(); ps_y = torch.cat(ps_y).numpy()
+    qs = torch.cat(qs).numpy(); ps_q = torch.cat(ps_q).numpy()
+
+    def f1pair(t, p):
+        return (f1_score(t, p, average='micro'), f1_score(t, p, average='macro'))
+
+    true_final = combine_last_grade(ys, qs)
+    pred_final = combine_last_grade(ps_y, ps_q)
+    
+    yield_f1_per_class = f1_score(ys, ps_y, labels=[0, 1, 2], average=None, zero_division=0)
+    quality_f1_per_class = f1_score(qs, ps_q, labels=[0, 1, 2, 3, 4], average=None, zero_division=0)
+    
+    return {
+        'loss': float(np.mean(losses)),
+        'yield': f1pair(ys, ps_y) + (cohen_kappa_score(ys, ps_y, weights='quadratic'),),
+        'quality': f1pair(qs, ps_q) + (cohen_kappa_score(qs, ps_q, weights='quadratic'),),
+        'final': f1pair(true_final, pred_final),
+        'yield_per_class': {'A': yield_f1_per_class[0], 'B': yield_f1_per_class[1], 'C': yield_f1_per_class[2]},
+      'quality_per_class': {'1++': quality_f1_per_class[0], '1+': quality_f1_per_class[1], '1': quality_f1_per_class[2], '2': quality_f1_per_class[3], '3': quality_f1_per_class[4]},
+    }

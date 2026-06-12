@@ -16,6 +16,7 @@ from math import sqrt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer
 from layers.Embed import PatchEmbedding
@@ -57,6 +58,34 @@ class FlattenHead(nn.Module):
         x = self.linear(x)
         x = self.dropout(x)
         return x
+
+
+class AttentionPool(nn.Module):
+    """
+    가변 길이 토큰 시퀀스를 학습형 스코어러로 마스크드 가중합하여 1벡터로 만든다.
+    (분류 head 앞단: LLM 출력 (B, L, d) -> (B, d). 패딩 토큰은 mask로 제외)
+
+    구현: additive(Bahdanau) 스타일 점수 MLP(Linear-Tanh-Linear).
+      - 기존 'query를 1/sqrt(d)로 축소 + 점수도 /sqrt(d)' 방식은 점수 규모가 너무 작아
+        softmax가 거의 균등(= 단순 평균 pooling)이 되어 샘플 구분이 사라졌다.
+      - 학습형 스코어러는 점수 규모를 스스로 키워 비균등 어텐션을 형성한다.
+    """
+
+    def __init__(self, d, hidden=None):
+        super().__init__()
+        hidden = hidden or d
+        self.score = nn.Sequential(
+            nn.Linear(d, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x, mask):
+        # x: (B, L, d), mask: (B, L) bool (유효 토큰 True)
+        scores = self.score(x).squeeze(-1)              # (B, L)
+        scores = scores.masked_fill(~mask, float('-inf'))
+        attn = torch.softmax(scores, dim=-1).unsqueeze(-1)  # (B, L, 1)
+        return (attn * x).sum(dim=1)                    # (B, d)
 
 
 class ReprogrammingLayer(nn.Module):
@@ -118,6 +147,8 @@ class Model(nn.Module):
     def __init__(self, configs, patch_len=16, stride=8):
         super(Model, self).__init__()
         self.task_name = configs.task_name
+        # forecasting(기존 회귀) / classification(한우 2-head 분류) 분기
+        self.task_type = getattr(configs, 'task_type', 'forecasting')
         self.pred_len = configs.pred_len # 예측 길이 (예: 96)
         self.seq_len = configs.seq_len # 입력 길이 (예: 512)
         self.d_ff = configs.d_ff             # LLM 출력에서 잘라 쓸 특징 차원
@@ -216,14 +247,25 @@ class Model(nn.Module):
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
         self.head_nf = self.d_ff * self.patch_nums  # 출력 헤드 입력 차원
 
-        # 4) 출력 투영 헤드
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+        # 4) 출력 투영 헤드 (task_type으로 분기)
+        if self.task_type == 'classification':
+            # ---- 한우 2-head 분류 헤드 ----
+            # 채널별 재프로그래밍 결과(d_llm)를 채널수만큼 concat -> Linear로 융합(d_llm)
+            self.enc_in = configs.enc_in
+            self.cls_hidden = getattr(configs, 'cls_hidden', 256)
+            self.channel_fuse = nn.Linear(configs.enc_in * self.d_llm, self.d_llm)  # 5*d_llm -> d_llm
+            self.pool = AttentionPool(self.d_llm)                                    # joint LLM 출력 풀링
+            self.layer1 = nn.Linear(self.d_llm, self.cls_hidden)                     # 공유 layer1
+            self.head_yield = nn.Linear(self.cls_hidden, getattr(configs, 'num_class_yield', 3))     # 육량 3
+            self.head_quality = nn.Linear(self.cls_hidden, getattr(configs, 'num_class_quality', 5)) # 육질 5
+        elif self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.output_projection = FlattenHead(
                 configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout)
         else:
             raise NotImplementedError
 
         # 5) RevIN 정규화 레이어 (affine=False: 학습 파라미터 없는 단순 정규화)
+        #    (분류 경로는 가변길이 대응 위해 _masked_normalize를 따로 사용)
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
 
     # ----------------- LLM/토크나이저 로드 헬퍼 -----------------
@@ -244,11 +286,70 @@ class Model(nn.Module):
             return tok_cls.from_pretrained(name, trust_remote_code=True, local_files_only=False)
 
     # ----------------- 순방향 -----------------
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]  # 마지막 pred_len 스텝만 반환
-        return None
+    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None):
+        # 분류: 위치인자를 (time_series, prompt(list[str]), x_mask) 로 재해석한다.
+        if self.task_type == 'classification':
+            return self.classify(x_enc, x_mark_enc, x_dec)
+        # 예측(기존): (x_enc, x_mark_enc, x_dec, x_mark_dec)
+        dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        return dec_out[:, -self.pred_len:, :]  # 마지막 pred_len 스텝만 반환
+
+    # ===================== 분류(classification) 경로 =====================
+    def _masked_normalize(self, x, mask, eps=1e-5):
+        """가변길이 RevIN: 채널별·인스턴스별로 유효 스텝만으로 표준화, 패딩 스텝은 0."""
+        # x: (B, T, C),  mask: (B, T) bool
+        m = mask.unsqueeze(-1).float()                       # (B, T, 1)
+        cnt = m.sum(dim=1).clamp(min=1.0)                    # (B, 1)
+        mean = (x * m).sum(dim=1) / cnt                      # (B, C)
+        mean = mean.unsqueeze(1)                             # (B, 1, C)
+        var = ((x - mean) ** 2 * m).sum(dim=1) / cnt         # (B, C)
+        std = torch.sqrt(var.unsqueeze(1) + eps)             # (B, 1, C)
+        xn = (x - mean) / std
+        return xn * m                                        # 패딩 스텝 0
+
+    def _patch_mask_from_step_mask(self, step_mask):
+        """PatchEmbedding과 동일한 ReplicationPad + unfold로 스텝마스크 -> 패치마스크(유효스텝 1개 이상이면 True)."""
+        mf = step_mask.float().unsqueeze(1)                                  # (N, 1, T)
+        mf = F.pad(mf, (0, self.stride), mode='replicate')                   # ReplicationPad1d((0, stride))
+        win = mf.unfold(dimension=-1, size=self.patch_len, step=self.stride) # (N, 1, P, patch_len)
+        return (win.sum(-1).squeeze(1) > 0)                                  # (N, P) bool
+
+    def classify(self, x_enc, prompt, x_mask):
+        dev = x_enc.device
+        B, T, N = x_enc.size()                               # N = enc_in (= 5)
+
+        # (1) masked RevIN + 채널독립 분리
+        x = self._masked_normalize(x_enc, x_mask)            # (B, T, N)
+        x = x.permute(0, 2, 1).reshape(B * N, T, 1)          # 채널독립 (B*N, T, 1)
+        m = x_mask.unsqueeze(1).repeat(1, N, 1).reshape(B * N, T)  # (B*N, T) 채널 확장 마스크
+
+        # (2) 채널별 패치 임베딩 + 채널별 재프로그래밍 (단변량, 기존 모듈 그대로)
+        x = x.permute(0, 2, 1).contiguous()                  # (B*N, 1, T)
+        enc, n_vars = self.patch_embedding(x)                # (B*N, P, d_model)
+        src = self.mapping_layer(self.word_embeddings.permute(1, 0).float()).permute(1, 0)
+        enc = self.reprogramming_layer(enc, src, src)        # (B*N, P, d_llm)
+        P = enc.shape[1]
+        pmask = self._patch_mask_from_step_mask(m)           # (B*N, P)
+
+        # (3) concat -> Linear 융합 (압축X / 채널구분인자X)
+        enc = enc.reshape(B, N, P, self.d_llm).permute(0, 2, 1, 3).reshape(B, P, N * self.d_llm)
+        fused = self.channel_fuse(enc)                       # (B, P, d_llm)
+        pmask_b = pmask.reshape(B, N, P)[:, 0, :]            # (B, P) 채널 무관 동일
+
+        # (4) 프롬프트 임베딩 ⊕ 융합패치 concat -> LLM 1회 (joint attention)
+        tok = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=2048)
+        input_ids = tok.input_ids.to(dev)
+        pattn = tok.attention_mask.to(dev)                   # (B, Lp) 프롬프트 패딩 마스크
+        pemb = self.llm_model.get_input_embeddings()(input_ids)   # (B, Lp, d_llm)
+        cat_dtype = self.llm_model.get_input_embeddings().weight.dtype
+        seq = torch.cat([pemb.to(cat_dtype), fused.to(cat_dtype)], dim=1)     # (B, Lp+P, d_llm)
+        amask = torch.cat([pattn, pmask_b.long()], dim=1)    # (B, Lp+P)
+        out = self.llm_model(inputs_embeds=seq, attention_mask=amask).last_hidden_state  # (B, Lp+P, d_llm)
+
+        # (5) attention pooling(전 차원 사용) + 2-head
+        z = self.pool(out.float(), amask.bool())             # (B, d_llm)
+        h = self.dropout(F.gelu(self.layer1(z)))             # (B, cls_hidden)
+        return self.head_yield(h), self.head_quality(h)      # (B, 3), (B, 5)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # ---- 1) RevIN 정규화 ----
