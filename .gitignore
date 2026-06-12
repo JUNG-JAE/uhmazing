@@ -1,2 +1,10 @@
 data/
+dataset/
+raw_hanwoo_data/
+raw_weather_data/
 nohup.out
+tft/checkpoints
+tft/lightning_logs
+checkpoints/
+__pycache__
+documents/

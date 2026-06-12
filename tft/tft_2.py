@@ -1,11 +1,8 @@
 # =============================================================================
-# tft.py — 한우 멀티태스크 TFT 파이프라인
-# 회귀 2개 (BACKFAT, REA) + 분류 5개 (INSFAT/YUKSAK/FATSAK/TISSUE/GROWTH 등급 클래스)
-# Kendall Uncertainty Weighting + 클래스 가중치 (INSFAT/YUKSAK/FATSAK/TISSUE)
-# 후처리: WINDEX → WGRADE, 육질등급 → LAST_GRADE
-
-# 회귀 2 + 분류 1 / 분류 5 
-# 회귀에 standard scale 적용
+# tft_expA.py — 한우 멀티태스크 TFT 파이프라인 (실험 A: 보조 태스크 방식)
+# 메인: WGRADE_CLASS(A/B/C) + QUALITY_GRADE_CLASS(1++/1+/1/2/3)
+# 보조: INSFAT/YUKSAK/FATSAK/TISSUE/GROWTH (학습에만 loss 사용, 예측 미사용)
+# LAST_GRADE = QUALITY_GRADE + WGRADE 단순 조합
 # =============================================================================
 
 import os
@@ -20,7 +17,6 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
     f1_score, classification_report, accuracy_score
 )
 
@@ -41,16 +37,26 @@ TRAIN_FILE = os.path.join(DATA_DIR, 'hanwoo_train_merged.parquet')
 TEST_FILE = os.path.join(DATA_DIR, 'hanwoo_test_merged.parquet')
 WEATHER_FILE = os.path.join(DATA_DIR, 'hanwoo_weather_augmented.csv')
 
-REGRESSION_TARGETS = ['BACKFAT', 'REA']
-CLASSIFICATION_TARGETS = [
+# ★ 메인 분류 태스크 (최종 예측에 사용)
+MAIN_TARGETS = ['WGRADE_CLASS', 'QUALITY_GRADE_CLASS']
+
+# ★ 보조 분류 태스크 (학습에만 loss 흐름, 예측에는 미사용)
+AUX_TARGETS = [
     'INSFAT_GRADE_CLASS', 'YUKSAK_GRADE_CLASS',
     'FATSAK_GRADE_CLASS', 'TISSUE_GRADE_CLASS',
     'GROWTH_STATUS_CLASS'
 ]
-ALL_TARGETS = REGRESSION_TARGETS + CLASSIFICATION_TARGETS
 
-WEIGHTED_TARGETS = ['INSFAT_GRADE_CLASS', 'YUKSAK_GRADE_CLASS',
-                    'FATSAK_GRADE_CLASS', 'TISSUE_GRADE_CLASS']
+ALL_TARGETS = MAIN_TARGETS + AUX_TARGETS
+
+# ★ 보조 태스크 loss 가중치 (메인 대비 비율)
+AUX_LOSS_WEIGHT = 0.3
+
+WEIGHTED_TARGETS = [
+    'WGRADE_CLASS', 'QUALITY_GRADE_CLASS',
+    'INSFAT_GRADE_CLASS', 'YUKSAK_GRADE_CLASS',
+    'FATSAK_GRADE_CLASS', 'TISSUE_GRADE_CLASS',
+]
 
 EXCLUDE_COLS = [
     'DATA_ROW_ID', 'CATTLE_NO', 'FARM_UNIQUE_NO',
@@ -59,8 +65,14 @@ EXCLUDE_COLS = [
     'PAST_SLAUGHTER_AVAILABLE',
     'PAST_WEIGHT_VARIANCE', 'PAST_BACKFAT_VARIANCE',
     'PAST_REA_VARIANCE',
+    # ★ 도축 후 측정값 전부 제외
+    'BACKFAT', 'REA',
     'INSFAT', 'YUKSAK', 'FATSAK', 'TISSUE', 'GROWTH',
+    'INSFAT_GRADE_CLASS', 'YUKSAK_GRADE_CLASS',
+    'FATSAK_GRADE_CLASS', 'TISSUE_GRADE_CLASS',
+    'GROWTH_STATUS_CLASS',
     'WINDEX', 'WGRADE', 'LAST_GRADE',
+    'WGRADE_CLASS', 'QUALITY_GRADE_CLASS',
     'ABATT_DATE', 'JUDGE_DATE', 'BIRTH_YMD',
 ]
 
@@ -78,12 +90,18 @@ MAX_SAMPLES = 300_000
 MAX_PREDICTION_LENGTH = 1
 BATCH_SIZE = 64
 
+# ★ LAST_GRADE 파싱용 매핑
+QUALITY_GRADE_MAP = {'1++': 0, '1+': 1, '1': 2, '2': 3, '3': 4}
+QUALITY_GRADE_INV = {v: k for k, v in QUALITY_GRADE_MAP.items()}
+WGRADE_MAP = {'A': 0, 'B': 1, 'C': 2}
+WGRADE_INV = {v: k for k, v in WGRADE_MAP.items()}
+
 print("=" * 70)
-print("한우 멀티태스크 TFT 파이프라인")
-print("회귀: BACKFAT, REA | 분류: INSFAT/YUKSAK/FATSAK/TISSUE/GROWTH 등급")
-print("Kendall Uncertainty Weighting + 클래스 가중치 (역빈도)")
-print("회귀 타깃 StandardScaler 정규화 적용")
-print("후처리: WINDEX → WGRADE, 육질등급 → LAST_GRADE")
+print("한우 멀티태스크 TFT 파이프라인 — 실험 A (보조 태스크 방식)")
+print("메인: WGRADE(A/B/C) + QUALITY_GRADE(1++/1+/1/2/3)")
+print("보조: INSFAT/YUKSAK/FATSAK/TISSUE/GROWTH (학습에만 loss)")
+print(f"보조 loss 가중치: {AUX_LOSS_WEIGHT}")
+print("LAST_GRADE = QUALITY_GRADE + WGRADE 조합")
 print("=" * 70)
 
 # =============================================================================
@@ -126,49 +144,49 @@ train_raw = clean_missing(train_raw)
 if test_raw is not None:
     test_raw = clean_missing(test_raw)
 
+# ★ LAST_GRADE에서 메인 타깃 파싱
+print("\n  [메인 타깃 생성: LAST_GRADE 파싱]")
+train_raw['QUALITY_GRADE_CLASS'] = train_raw['LAST_GRADE'].astype(str).str[:-1]
+train_raw['WGRADE_CLASS'] = train_raw['LAST_GRADE'].astype(str).str[-1]
+
+train_raw['QUALITY_GRADE_CLASS'] = train_raw['QUALITY_GRADE_CLASS'].map(QUALITY_GRADE_MAP)
+train_raw['WGRADE_CLASS'] = train_raw['WGRADE_CLASS'].map(WGRADE_MAP)
+
 before = len(train_raw)
-train_raw = train_raw.dropna(subset=ALL_TARGETS).reset_index(drop=True)
-print(f"  타깃 결측 제거: {before} → {len(train_raw)}")
+train_raw = train_raw.dropna(subset=['QUALITY_GRADE_CLASS', 'WGRADE_CLASS']).reset_index(drop=True)
+train_raw['QUALITY_GRADE_CLASS'] = train_raw['QUALITY_GRADE_CLASS'].astype(int)
+train_raw['WGRADE_CLASS'] = train_raw['WGRADE_CLASS'].astype(int)
+print(f"  LAST_GRADE 파싱: {before} → {len(train_raw)} rows")
 
-for col in REGRESSION_TARGETS:
+# 보조 타깃 결측 제거
+for col in AUX_TARGETS:
     train_raw[col] = pd.to_numeric(train_raw[col], errors='coerce')
-for col in CLASSIFICATION_TARGETS:
-    train_raw[col] = pd.to_numeric(train_raw[col], errors='coerce').astype(int)
+train_raw = train_raw.dropna(subset=ALL_TARGETS).reset_index(drop=True)
+for col in ALL_TARGETS:
+    train_raw[col] = train_raw[col].astype(int)
+print(f"  타깃 결측 제거 후: {len(train_raw)} rows")
 
+# 클래스 수 및 분포
 NUM_CLASSES = {}
-for col in CLASSIFICATION_TARGETS:
-    NUM_CLASSES[col] = int(train_raw[col].max()) + 1
-    print(f"  {col}: {NUM_CLASSES[col]} classes, dist={dict(train_raw[col].value_counts().sort_index())}")
-
-print(f"  BACKFAT: mean={train_raw['BACKFAT'].mean():.2f}, std={train_raw['BACKFAT'].std():.2f}")
-print(f"  REA: mean={train_raw['REA'].mean():.2f}, std={train_raw['REA'].std():.2f}")
-
-# ★ 회귀 타깃 정규화 (StandardScaler)
-REG_STATS = {}
-for col in REGRESSION_TARGETS:
-    mu = float(train_raw[col].mean())
-    sigma = float(train_raw[col].std())
-    if sigma == 0:
-        sigma = 1.0
-    REG_STATS[col] = {'mean': mu, 'std': sigma}
-    print(f"  [정규화] {col}: mean={mu:.4f}, std={sigma:.4f}")
-
 CLASS_WEIGHTS = {}
-print("\n  [클래스 가중치 계산]")
-for col in CLASSIFICATION_TARGETS:
+print("\n  [클래스 분포 및 가중치]")
+for col in ALL_TARGETS:
+    counts = train_raw[col].value_counts().sort_index()
+    n_classes = int(train_raw[col].max()) + 1
+    NUM_CLASSES[col] = n_classes
+    print(f"    {col}: {n_classes} classes, dist={dict(counts)}")
+
     if col in WEIGHTED_TARGETS:
-        counts = train_raw[col].value_counts().sort_index()
         n_samples = len(train_raw)
-        n_classes = NUM_CLASSES[col]
         w = torch.tensor(
             [n_samples / (n_classes * counts.get(i, 1)) for i in range(n_classes)],
             dtype=torch.float32
         )
         CLASS_WEIGHTS[col] = w
-        print(f"    {col}: {[f'{x:.4f}' for x in w.tolist()]}")
+        print(f"      weights: {[f'{x:.4f}' for x in w.tolist()]}")
     else:
         CLASS_WEIGHTS[col] = None
-        print(f"    {col}: 없음 (균등 CrossEntropy)")
+        print(f"      (균등 CrossEntropy)")
 
 # =============================================================================
 # 섹션 3: 피처 전처리
@@ -289,14 +307,13 @@ for v in WEATHER_VARS:
     weather_global_median[v] = weather_weekly[v].median()
 
 # =============================================================================
-# 섹션 5: 시퀀스 데이터 생성 (개체별 출생~도축 주차) — 메모리 최적화
+# 섹션 5: 시퀀스 데이터 생성
 # =============================================================================
 print("\n[섹션 5] 시퀀스 데이터 생성...")
 
 def build_sequences(df, weather_dict, weather_global_median, static_cols,
-                    max_samples=None, is_test=False, reg_stats=None):
-    """각 소 개체에 대해 출생~도축 주간 시퀀스 생성 (청크 방식)
-       reg_stats가 주어지면 회귀 타깃을 정규화해서 저장"""
+                    max_samples=None, is_test=False):
+    """각 소 개체에 대해 출생~도축 주간 시퀀스 생성 (청크 방식)"""
     
     valid = df.dropna(subset=['BIRTH_YMD', 'ABATT_DATE']).copy()
     valid['stn_int'] = pd.to_numeric(valid['stn'] if 'stn' in valid.columns else
@@ -340,21 +357,14 @@ def build_sequences(df, weather_dict, weather_global_median, static_cols,
                 val = row.get(col, 0.0)
                 static_vals[col] = float(val) if not pd.isna(val) else 0.0
             
-            # 타깃: train이면 실제값(회귀는 정규화), test이면 더미값
+            # 타깃
             targets = {}
             if is_test:
                 for t in ALL_TARGETS:
-                    targets[t] = 0 if t in CLASSIFICATION_TARGETS else 0.0
+                    targets[t] = 0
             else:
                 for t in ALL_TARGETS:
-                    raw_val = row[t]
-                    # ★ 회귀 타깃 정규화
-                    if t in REGRESSION_TARGETS and reg_stats:
-                        mu = reg_stats[t]['mean']
-                        sigma = reg_stats[t]['std']
-                        targets[t] = (float(raw_val) - mu) / sigma
-                    else:
-                        targets[t] = raw_val
+                    targets[t] = int(row[t])
             
             weight_val = float(row.get('WEIGHT', 0.0)) if not pd.isna(row.get('WEIGHT', np.nan)) else 0.0
             sex_val = row.get('JUDGE_SEX_orig', 'unknown')
@@ -364,14 +374,14 @@ def build_sequences(df, weather_dict, weather_global_median, static_cols,
                 farm_id = f'farm_{idx}'
             
             n_weeks = len(weeks)
-            for t, week_date in enumerate(weeks):
+            for t_idx, week_date in enumerate(weeks):
                 yr = week_date.isocalendar()[0]
                 wk = week_date.isocalendar()[1]
                 yw = f"{yr}-W{wk:02d}"
                 
                 seq_row = {
                     'cattle_idx': idx,
-                    'time_idx': t,
+                    'time_idx': t_idx,
                     'farm_id': farm_id,
                     'weight_val': weight_val,
                     'sex_val': sex_val,
@@ -385,11 +395,10 @@ def build_sequences(df, weather_dict, weather_global_median, static_cols,
                     seq_row.update(weather_global_median)
                 
                 for tgt in ALL_TARGETS:
-                    if t == n_weeks - 1:
+                    if t_idx == n_weeks - 1:
                         seq_row[tgt] = targets[tgt]
                     else:
-                        # ★ 비최종 주차: 회귀도 정규화된 0 (= -mean/std)이 아니라 그냥 0.0
-                        seq_row[tgt] = 0 if tgt in CLASSIFICATION_TARGETS else 0.0
+                        seq_row[tgt] = 0
                 
                 chunk_rows.append(seq_row)
         
@@ -409,10 +418,9 @@ def build_sequences(df, weather_dict, weather_global_median, static_cols,
     print(f"    생성 완료: {len(result):,} rows, 건너뜀: {skipped}")
     return result
 
-# ★ reg_stats 전달
 seq_train = build_sequences(train_df, weather_dict, weather_global_median,
                             static_real_cols, max_samples=MAX_SAMPLES,
-                            is_test=False, reg_stats=REG_STATS)
+                            is_test=False)
 
 # 시퀀스 길이 통계
 seq_lengths = seq_train.groupby('cattle_idx')['time_idx'].max() + 1
@@ -454,12 +462,11 @@ print("\n[섹션 7] 커스텀 Dataset 생성...")
 
 class HanwooSequenceDataset(Dataset):
     def __init__(self, df, static_cols, weather_vars, max_encoder_length,
-                 regression_targets, classification_targets):
+                 all_targets):
         self.static_cols = static_cols
         self.weather_vars = weather_vars
         self.max_enc_len = max_encoder_length
-        self.reg_targets = regression_targets
-        self.cls_targets = classification_targets
+        self.all_targets = all_targets
         
         self.groups = []
         for cattle_id, grp in df.groupby('cattle_idx'):
@@ -487,13 +494,9 @@ class HanwooSequenceDataset(Dataset):
         )
         
         last_row = grp.iloc[-1]
-        # ★ 회귀 타깃: 이미 정규화된 값이 들어있음
-        reg_vals = torch.tensor(
-            [float(last_row[t]) for t in self.reg_targets],
-            dtype=torch.float32
-        )
-        cls_vals = torch.tensor(
-            [int(last_row[t]) for t in self.cls_targets],
+        # ★ 모든 타깃이 분류 (int)
+        target_vals = torch.tensor(
+            [int(last_row[t]) for t in self.all_targets],
             dtype=torch.long
         )
         
@@ -504,8 +507,7 @@ class HanwooSequenceDataset(Dataset):
             'static': static_vals,
             'weather': weather_seq,
             'seq_len': seq_len,
-            'reg_targets': reg_vals,
-            'cls_targets': cls_vals,
+            'targets': target_vals,
             'weight': weight_val,
             'sex': sex_val,
         }
@@ -513,14 +515,12 @@ class HanwooSequenceDataset(Dataset):
 def collate_fn(batch):
     max_len = max(b['seq_len'] for b in batch)
     bs = len(batch)
-    n_static = batch[0]['static'].shape[0]
     n_weather = batch[0]['weather'].shape[1]
     
     static = torch.stack([b['static'] for b in batch])
     weather = torch.zeros(bs, max_len, n_weather)
     mask = torch.zeros(bs, max_len, dtype=torch.bool)
-    reg_targets = torch.stack([b['reg_targets'] for b in batch])
-    cls_targets = torch.stack([b['cls_targets'] for b in batch])
+    targets = torch.stack([b['targets'] for b in batch])
     seq_lens = torch.tensor([b['seq_len'] for b in batch])
     weights = [b['weight'] for b in batch]
     sexes = [b['sex'] for b in batch]
@@ -535,19 +535,16 @@ def collate_fn(batch):
         'weather': weather,
         'mask': mask,
         'seq_lens': seq_lens,
-        'reg_targets': reg_targets,
-        'cls_targets': cls_targets,
+        'targets': targets,
         'weights': weights,
         'sexes': sexes,
     }
 
 train_dataset = HanwooSequenceDataset(
-    ts_train, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH,
-    REGRESSION_TARGETS, CLASSIFICATION_TARGETS
+    ts_train, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH, ALL_TARGETS
 )
 val_dataset = HanwooSequenceDataset(
-    ts_val, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH,
-    REGRESSION_TARGETS, CLASSIFICATION_TARGETS
+    ts_val, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH, ALL_TARGETS
 )
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -626,11 +623,21 @@ class TemporalBlock(nn.Module):
 class MultiTaskTFT(pl.LightningModule):
     def __init__(self, n_static, n_weather, hidden_size=128, num_heads=4,
                  dropout=0.1, num_classes_dict=None, learning_rate=1e-3,
-                 class_weights=None):
+                 class_weights=None, main_targets=None, aux_targets=None,
+                 aux_loss_weight=0.3):
         super().__init__()
         self.save_hyperparameters(ignore=['class_weights'])
         self.learning_rate = learning_rate
         self.num_classes_dict = num_classes_dict or {}
+        
+        # ★ 메인/보조 태스크 구분
+        self.main_targets = main_targets or MAIN_TARGETS
+        self.aux_targets = aux_targets or AUX_TARGETS
+        self.all_targets = self.main_targets + self.aux_targets
+        self.aux_loss_weight = aux_loss_weight
+        
+        # 타깃 인덱스 매핑 (targets 텐서에서의 위치)
+        self.target_indices = {t: i for i, t in enumerate(self.all_targets)}
         
         self.static_proj = nn.Sequential(
             nn.Linear(n_static, hidden_size),
@@ -651,19 +658,7 @@ class MultiTaskTFT(pl.LightningModule):
             hidden_size, hidden_size, num_heads, dropout
         )
         
-        self.reg_head_backfat = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
-        )
-        self.reg_head_rea = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
-        )
-        
+        # ★ 모든 태스크가 분류 헤드
         self.cls_heads = nn.ModuleDict()
         for col, nc in self.num_classes_dict.items():
             self.cls_heads[col] = nn.Sequential(
@@ -673,11 +668,10 @@ class MultiTaskTFT(pl.LightningModule):
                 nn.Linear(hidden_size // 2, nc),
             )
         
-        n_tasks = 2 + len(self.num_classes_dict)
-        self.uncertainty_loss = UncertaintyWeightedLoss(n_tasks)
+        # ★ Kendall: 메인 태스크에만 적용
+        self.uncertainty_loss = UncertaintyWeightedLoss(len(self.main_targets))
         
-        self.mse_loss = nn.MSELoss()
-        
+        # 손실 함수
         self.ce_losses = nn.ModuleDict()
         for col in self.num_classes_dict:
             if class_weights and class_weights.get(col) is not None:
@@ -700,64 +694,62 @@ class MultiTaskTFT(pl.LightningModule):
         last_indices = (seq_lens - 1).long()
         last_hidden = encoded[torch.arange(bs, device=encoded.device), last_indices]
         
-        backfat_pred = self.reg_head_backfat(last_hidden).squeeze(-1)
-        rea_pred = self.reg_head_rea(last_hidden).squeeze(-1)
-        
         cls_logits = {}
         for col in self.num_classes_dict:
             cls_logits[col] = self.cls_heads[col](last_hidden)
         
-        return backfat_pred, rea_pred, cls_logits
+        return cls_logits
     
     def _compute_loss(self, batch):
         static = batch['static']
         weather = batch['weather']
         mask = batch['mask']
         seq_lens = batch['seq_lens']
-        reg_targets = batch['reg_targets']
-        cls_targets = batch['cls_targets']
+        targets = batch['targets']
         
-        backfat_pred, rea_pred, cls_logits = self(static, weather, mask, seq_lens)
+        cls_logits = self(static, weather, mask, seq_lens)
         
-        # ★ 회귀 loss: 정규화된 타깃과 비교 (스케일 ≈ 1.0)
-        loss_backfat = self.mse_loss(backfat_pred, reg_targets[:, 0])
-        loss_rea = self.mse_loss(rea_pred, reg_targets[:, 1])
+        main_losses = []
+        aux_losses = []
+        losses_dict = {}
         
-        cls_losses = []
-        cls_cols = list(self.num_classes_dict.keys())
-        for i, col in enumerate(cls_cols):
+        for col in self.all_targets:
             logits = cls_logits[col]
-            target = cls_targets[:, i].clamp(0, self.num_classes_dict[col] - 1)
-            cls_losses.append(self.ce_losses[col](logits, target))
+            col_idx = self.target_indices[col]
+            target = targets[:, col_idx].clamp(0, self.num_classes_dict[col] - 1)
+            loss = self.ce_losses[col](logits, target)
+            losses_dict[col] = loss.detach()
+            
+            if col in self.main_targets:
+                main_losses.append(loss)
+            else:
+                aux_losses.append(loss)
         
-        all_losses = [loss_backfat, loss_rea] + cls_losses
-        total_loss = self.uncertainty_loss(all_losses)
+        # ★ 메인: Kendall uncertainty weighting
+        main_total = self.uncertainty_loss(main_losses)
         
-        return total_loss, loss_backfat, loss_rea, cls_losses, backfat_pred, rea_pred, cls_logits
+        # ★ 보조: 단순 평균 × aux_loss_weight
+        if aux_losses:
+            aux_total = sum(aux_losses) / len(aux_losses) * self.aux_loss_weight
+        else:
+            aux_total = 0.0
+        
+        total_loss = main_total + aux_total
+        
+        return total_loss, losses_dict, cls_logits
     
     def training_step(self, batch, batch_idx):
-        total_loss, loss_bf, loss_rea, cls_losses, _, _, _ = self._compute_loss(batch)
-        
+        total_loss, losses_dict, _ = self._compute_loss(batch)
         self.log('train_loss', total_loss, prog_bar=True)
-        self.log('train_loss_backfat', loss_bf)
-        self.log('train_loss_rea', loss_rea)
-        cls_cols = list(self.num_classes_dict.keys())
-        for i, col in enumerate(cls_cols):
-            self.log(f'train_loss_{col}', cls_losses[i])
-        
+        for name, val in losses_dict.items():
+            self.log(f'train_{name}', val)
         return total_loss
     
     def validation_step(self, batch, batch_idx):
-        total_loss, loss_bf, loss_rea, cls_losses, bp, rp, cl = self._compute_loss(batch)
-        
+        total_loss, losses_dict, _ = self._compute_loss(batch)
         self.log('val_loss', total_loss, prog_bar=True)
-        self.log('val_loss_backfat', loss_bf)
-        self.log('val_loss_rea', loss_rea)
-        
-        cls_cols = list(self.num_classes_dict.keys())
-        for i, col in enumerate(cls_cols):
-            self.log(f'val_loss_{col}', cls_losses[i])
-        
+        for name, val in losses_dict.items():
+            self.log(f'val_{name}', val)
         return total_loss
     
     def configure_optimizers(self):
@@ -785,15 +777,21 @@ model = MultiTaskTFT(
     num_classes_dict=NUM_CLASSES,
     learning_rate=1e-3,
     class_weights=CLASS_WEIGHTS,
+    main_targets=MAIN_TARGETS,
+    aux_targets=AUX_TARGETS,
+    aux_loss_weight=AUX_LOSS_WEIGHT,
 )
 
 total_params = sum(p.numel() for p in model.parameters())
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"  총 파라미터: {total_params:,} ({trainable:,} trainable)")
-print(f"  태스크: 회귀 2개 (BACKFAT, REA) + 분류 {len(NUM_CLASSES)}개")
+print(f"  메인 태스크: {MAIN_TARGETS}")
+print(f"  보조 태스크: {AUX_TARGETS}")
+print(f"  보조 loss 가중치: {AUX_LOSS_WEIGHT}")
 for col, nc in NUM_CLASSES.items():
+    role = "메인" if col in MAIN_TARGETS else "보조"
     w_info = "가중치 적용" if CLASS_WEIGHTS.get(col) is not None else "균등"
-    print(f"    {col}: {nc} classes ({w_info})")
+    print(f"    [{role}] {col}: {nc} classes ({w_info})")
 
 # =============================================================================
 # 섹션 10: 학습
@@ -804,7 +802,7 @@ callbacks = [
     EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=True),
     ModelCheckpoint(
         dirpath='checkpoints/',
-        filename='tft_multitask_best',
+        filename='tft_expA_best',
         monitor='val_loss',
         mode='min',
         save_top_k=1,
@@ -826,49 +824,13 @@ trainer = pl.Trainer(
 trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 # =============================================================================
-# 섹션 11: 육량지수(WINDEX) 및 등급 계산 함수
+# 섹션 11: 평가 함수
 # =============================================================================
 
-def compute_windex(backfat, rea, weight, sex):
-    if weight == 0:
-        return 0.0
-    if sex == '암':
-        numerator = 6.90137 - 0.9446 * backfat + 0.31805 * rea + 0.54952 * weight
-    elif sex == '수':
-        numerator = 0.20103 - 2.18525 * backfat + 0.29275 * rea + 0.64099 * weight
-    else:
-        numerator = 11.06398 - 1.25149 * backfat + 0.28293 * rea + 0.56781 * weight
-    return numerator / weight * 100
-
-def compute_wgrade(windex, sex):
-    if sex == '암':
-        if windex >= 61.83: return 'A'
-        elif windex >= 59.70: return 'B'
-        else: return 'C'
-    elif sex == '수':
-        if windex >= 68.45: return 'A'
-        elif windex >= 66.32: return 'B'
-        else: return 'C'
-    else:
-        if windex >= 62.52: return 'A'
-        elif windex >= 60.40: return 'B'
-        else: return 'C'
-
-QUALITY_GRADE_MAP = {0: '1++', 1: '1+', 2: '1', 3: '2', 4: '3'}
-QUALITY_DOWNGRADE = {'1++': '1+', '1+': '1', '1': '2', '2': '3', '3': '등외'}
-
-def compute_quality_grade(insfat_cls, yuksak_cls, fatsak_cls, tissue_cls, growth_cls):
-    worst = max(insfat_cls, yuksak_cls, fatsak_cls, tissue_cls)
-    grade = QUALITY_GRADE_MAP.get(worst, '3')
-    if growth_cls == 1 and worst < 4:
-        grade = QUALITY_DOWNGRADE.get(grade, grade)
-    return grade
-
-def compute_last_grade(quality_grade, wgrade):
-    return f"{quality_grade}{wgrade}"
+# (기존 WINDEX/WGRADE 함수는 실험 A에서 불필요하지만 참고용으로 유지)
 
 # =============================================================================
-# 섹션 12: 평가 (Validation) — ★ 회귀 예측값 역변환
+# 섹션 12: 검증 평가
 # =============================================================================
 print("\n[섹션 12] 검증 평가...")
 
@@ -885,13 +847,8 @@ model.eval()
 model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
 device = next(model.parameters()).device
 
-all_bf_pred, all_bf_true = [], []
-all_rea_pred, all_rea_true = [], []
-all_cls_pred = {col: [] for col in CLASSIFICATION_TARGETS}
-all_cls_true = {col: [] for col in CLASSIFICATION_TARGETS}
-all_weights, all_sexes = [], []
-all_quality_pred, all_wgrade_pred, all_last_grade_pred = [], [], []
-all_quality_true, all_wgrade_true, all_last_grade_true = [], [], []
+all_preds = {t: [] for t in ALL_TARGETS}
+all_trues = {t: [] for t in ALL_TARGETS}
 
 with torch.no_grad():
     for batch in val_loader:
@@ -899,56 +856,43 @@ with torch.no_grad():
         weather = batch['weather'].to(device)
         mask = batch['mask'].to(device)
         seq_lens = batch['seq_lens'].to(device)
-        reg_targets = batch['reg_targets']
-        cls_targets = batch['cls_targets']
+        targets = batch['targets']
         
-        bp, rp, cl = model(static, weather, mask, seq_lens)
+        cls_logits = model(static, weather, mask, seq_lens)
         
-        # ★ 역변환: 정규화된 예측/타깃 → 원래 스케일
-        bf_mu, bf_std = REG_STATS['BACKFAT']['mean'], REG_STATS['BACKFAT']['std']
-        rea_mu, rea_std = REG_STATS['REA']['mean'], REG_STATS['REA']['std']
-        
-        bp_orig = bp.cpu().numpy() * bf_std + bf_mu
-        rp_orig = rp.cpu().numpy() * rea_std + rea_mu
-        bt_orig = reg_targets[:, 0].numpy() * bf_std + bf_mu
-        rt_orig = reg_targets[:, 1].numpy() * rea_std + rea_mu
-        
-        all_bf_pred.extend(bp_orig)
-        all_bf_true.extend(bt_orig)
-        all_rea_pred.extend(rp_orig)
-        all_rea_true.extend(rt_orig)
-        
-        cls_cols = list(NUM_CLASSES.keys())
-        for i, col in enumerate(cls_cols):
-            preds = cl[col].argmax(dim=-1).cpu().numpy()
-            trues = cls_targets[:, i].numpy()
-            all_cls_pred[col].extend(preds)
-            all_cls_true[col].extend(trues)
-        
-        all_weights.extend(batch['weights'])
-        all_sexes.extend(batch['sexes'])
+        for col in ALL_TARGETS:
+            col_idx = model.target_indices[col]
+            preds = cls_logits[col].argmax(dim=-1).cpu().numpy()
+            trues = targets[:, col_idx].numpy()
+            all_preds[col].extend(preds)
+            all_trues[col].extend(trues)
 
-# 회귀 평가 (원래 스케일)
+# ★ 메인 태스크 평가
 print("\n" + "=" * 50)
-print("회귀 평가 (원래 스케일로 역변환)")
+print("메인 태스크 분류 평가")
 print("=" * 50)
-for name, pred, true in [('BACKFAT', all_bf_pred, all_bf_true),
-                          ('REA', all_rea_pred, all_rea_true)]:
-    pred = np.array(pred)
-    true = np.array(true)
-    mae = mean_absolute_error(true, pred)
-    rmse = np.sqrt(mean_squared_error(true, pred))
-    r2 = r2_score(true, pred)
-    print(f"\n  {name}:")
-    print(f"    MAE  = {mae:.4f}")
-    print(f"    RMSE = {rmse:.4f}")
-    print(f"    R²   = {r2:.4f}")
 
-# 분류 평가
+wgrade_names = ['A', 'B', 'C']
+quality_names = ['1++', '1+', '1', '2', '3']
+
+for col, names in [('WGRADE_CLASS', wgrade_names), ('QUALITY_GRADE_CLASS', quality_names)]:
+    pred = np.array(all_preds[col])
+    true = np.array(all_trues[col])
+    f1 = f1_score(true, pred, average='macro', zero_division=0)
+    acc = accuracy_score(true, pred)
+    w_info = "가중치 적용" if CLASS_WEIGHTS.get(col) is not None else "균등"
+    print(f"\n  {col} ({w_info}): Macro F1={f1:.4f}, Accuracy={acc:.4f}")
+    try:
+        print(classification_report(true, pred, target_names=names, zero_division=0))
+    except Exception as e:
+        print(f"    classification_report 오류: {e}")
+
+# ★ 보조 태스크 평가 (참고용)
 print("\n" + "=" * 50)
-print("분류 평가")
+print("보조 태스크 분류 평가 (참고)")
 print("=" * 50)
-TASK_CLASS_NAMES = {
+
+AUX_CLASS_NAMES = {
     'INSFAT_GRADE_CLASS': ['1++', '1+', '1', '2', '3'],
     'YUKSAK_GRADE_CLASS': ['1++', '1+', '1', '2', '3'],
     'FATSAK_GRADE_CLASS': ['1++', '1+', '1', '2', '3'],
@@ -956,126 +900,85 @@ TASK_CLASS_NAMES = {
     'GROWTH_STATUS_CLASS': ['정상', '비정상'],
 }
 
-for col in CLASSIFICATION_TARGETS:
-    pred = np.array(all_cls_pred[col])
-    true = np.array(all_cls_true[col])
+for col in AUX_TARGETS:
+    pred = np.array(all_preds[col])
+    true = np.array(all_trues[col])
     f1 = f1_score(true, pred, average='macro', zero_division=0)
     acc = accuracy_score(true, pred)
-    names = TASK_CLASS_NAMES.get(col, None)
     w_info = "가중치 적용" if CLASS_WEIGHTS.get(col) is not None else "균등"
     print(f"\n  {col} ({w_info}): Macro F1={f1:.4f}, Accuracy={acc:.4f}")
     try:
-        if names and len(names) == NUM_CLASSES[col]:
-            print(classification_report(true, pred, target_names=names, zero_division=0))
-        else:
-            print(classification_report(true, pred, zero_division=0))
+        labels = sorted(set(true) | set(pred))
+        names = [AUX_CLASS_NAMES[col][i] for i in labels] if col in AUX_CLASS_NAMES else None
+        print(classification_report(true, pred, labels=labels, target_names=names, zero_division=0))
     except Exception as e:
         print(f"    classification_report 오류: {e}")
 
-# Derived 평가 (★ 역변환된 원래 스케일 사용)
+# ★ LAST_GRADE 평가
 print("\n" + "=" * 50)
-print("Derived 평가 (WGRADE, LAST_GRADE)")
+print("LAST_GRADE 평가")
 print("=" * 50)
 
-bf_pred = np.array(all_bf_pred)
-rea_pred = np.array(all_rea_pred)
-bf_true = np.array(all_bf_true)
-rea_true = np.array(all_rea_true)
+pred_last = []
+true_last = []
 
-for i in range(len(all_weights)):
-    w = float(all_weights[i])
-    sex = all_sexes[i]
+for i in range(len(all_preds['WGRADE_CLASS'])):
+    q_pred = QUALITY_GRADE_INV[all_preds['QUALITY_GRADE_CLASS'][i]]
+    w_pred = WGRADE_INV[all_preds['WGRADE_CLASS'][i]]
+    pred_last.append(f"{q_pred}{w_pred}")
     
-    windex_p = compute_windex(bf_pred[i], rea_pred[i], w, sex)
-    wgrade_p = compute_wgrade(windex_p, sex)
-    
-    insfat_p = int(all_cls_pred['INSFAT_GRADE_CLASS'][i])
-    yuksak_p = int(all_cls_pred['YUKSAK_GRADE_CLASS'][i])
-    fatsak_p = int(all_cls_pred['FATSAK_GRADE_CLASS'][i])
-    tissue_p = int(all_cls_pred['TISSUE_GRADE_CLASS'][i])
-    growth_p = int(all_cls_pred['GROWTH_STATUS_CLASS'][i])
-    
-    quality_p = compute_quality_grade(insfat_p, yuksak_p, fatsak_p, tissue_p, growth_p)
-    last_grade_p = compute_last_grade(quality_p, wgrade_p)
-    
-    all_wgrade_pred.append(wgrade_p)
-    all_quality_pred.append(quality_p)
-    all_last_grade_pred.append(last_grade_p)
-    
-    windex_t = compute_windex(bf_true[i], rea_true[i], w, sex)
-    wgrade_t = compute_wgrade(windex_t, sex)
-    
-    insfat_t = int(all_cls_true['INSFAT_GRADE_CLASS'][i])
-    yuksak_t = int(all_cls_true['YUKSAK_GRADE_CLASS'][i])
-    fatsak_t = int(all_cls_true['FATSAK_GRADE_CLASS'][i])
-    tissue_t = int(all_cls_true['TISSUE_GRADE_CLASS'][i])
-    growth_t = int(all_cls_true['GROWTH_STATUS_CLASS'][i])
-    
-    quality_t = compute_quality_grade(insfat_t, yuksak_t, fatsak_t, tissue_t, growth_t)
-    last_grade_t = compute_last_grade(quality_t, wgrade_t)
-    
-    all_wgrade_true.append(wgrade_t)
-    all_quality_true.append(quality_t)
-    all_last_grade_true.append(last_grade_t)
+    q_true = QUALITY_GRADE_INV[all_trues['QUALITY_GRADE_CLASS'][i]]
+    w_true = WGRADE_INV[all_trues['WGRADE_CLASS'][i]]
+    true_last.append(f"{q_true}{w_true}")
 
-wgrade_acc = accuracy_score(all_wgrade_true, all_wgrade_pred)
-wgrade_f1 = f1_score(all_wgrade_true, all_wgrade_pred, average='macro', zero_division=0)
-print(f"\n  WGRADE: Accuracy={wgrade_acc:.4f}, Macro F1={wgrade_f1:.4f}")
+all_grade_labels = []
+for q in ['1++', '1+', '1', '2', '3']:
+    for w in ['A', 'B', 'C']:
+        all_grade_labels.append(f"{q}{w}")
+
+last_f1 = f1_score(true_last, pred_last, average='macro', labels=all_grade_labels, zero_division=0)
+last_acc = accuracy_score(true_last, pred_last)
+print(f"\n  LAST_GRADE: Macro F1={last_f1:.4f}, Accuracy={last_acc:.4f}")
 try:
-    print(classification_report(all_wgrade_true, all_wgrade_pred, zero_division=0))
+    print(classification_report(true_last, pred_last, labels=all_grade_labels, zero_division=0))
 except Exception as e:
-    print(f"    {e}")
+    print(f"    classification_report 오류: {e}")
 
-quality_acc = accuracy_score(all_quality_true, all_quality_pred)
-quality_f1 = f1_score(all_quality_true, all_quality_pred, average='macro', zero_division=0)
-print(f"\n  육질등급: Accuracy={quality_acc:.4f}, Macro F1={quality_f1:.4f}")
-try:
-    print(classification_report(all_quality_true, all_quality_pred, zero_division=0))
-except Exception as e:
-    print(f"    {e}")
-
-lg_acc = accuracy_score(all_last_grade_true, all_last_grade_pred)
-lg_f1 = f1_score(all_last_grade_true, all_last_grade_pred, average='macro', zero_division=0)
-print(f"\n  LAST_GRADE: Accuracy={lg_acc:.4f}, Macro F1={lg_f1:.4f}")
-try:
-    print(classification_report(all_last_grade_true, all_last_grade_pred, zero_division=0))
-except Exception as e:
-    print(f"    {e}")
-
-# Kendall 가중치 출력
+# ★ Kendall Weights (메인 태스크만)
+print("\n" + "=" * 50)
+print("Kendall Uncertainty Weights (메인 태스크)")
+print("=" * 50)
 weights_k, sigma_sq = model.uncertainty_loss.get_weights()
-task_names = ['BACKFAT', 'REA'] + list(NUM_CLASSES.keys())
-print("\n" + "=" * 50)
-print("Kendall Uncertainty Weights")
-print("=" * 50)
-for i, name in enumerate(task_names):
+for i, name in enumerate(MAIN_TARGETS):
     print(f"  {name}: weight={weights_k[i]:.4f}, σ²={sigma_sq[i]:.4f}")
 
 # =============================================================================
-# 섹션 13: 테스트 데이터 추론 — ★ 역변환 적용
+# 섹션 13: 테스트 데이터 추론
 # =============================================================================
 if has_test:
     print("\n[섹션 13] 테스트 데이터 추론...")
     
+    # ★ 테스트 데이터에도 더미 타깃 컬럼 추가
+    for t in ALL_TARGETS:
+        if t not in test_df.columns:
+            test_df[t] = 0
+    
     seq_test = build_sequences(test_df, weather_dict, weather_global_median,
-                               static_cols=static_real_cols, is_test=True,
-                               reg_stats=REG_STATS)
+                               static_cols=static_real_cols, is_test=True)
     
     if len(seq_test) > 0:
-        # 시퀀스 길이 필터
         test_seq_lengths = seq_test.groupby('cattle_idx')['time_idx'].max() + 1
         valid_test_cattle = test_seq_lengths[test_seq_lengths >= min_len].index
         seq_test = seq_test[seq_test['cattle_idx'].isin(valid_test_cattle)].reset_index(drop=True)
         print(f"  테스트 유효 개체: {seq_test['cattle_idx'].nunique()}, 총 rows: {len(seq_test)}")
         
         test_dataset = HanwooSequenceDataset(
-            seq_test, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH,
-            REGRESSION_TARGETS, CLASSIFICATION_TARGETS
+            seq_test, static_real_cols, WEATHER_VARS, MAX_ENCODER_LENGTH, ALL_TARGETS
         )
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                  num_workers=4, collate_fn=collate_fn, pin_memory=True)
         
-        test_results = []
+        test_preds = {t: [] for t in MAIN_TARGETS}
         
         with torch.no_grad():
             for batch in test_loader:
@@ -1084,50 +987,23 @@ if has_test:
                 mask = batch['mask'].to(device)
                 seq_lens = batch['seq_lens'].to(device)
                 
-                bp, rp, cl = model(static, weather, mask, seq_lens)
+                cls_logits = model(static, weather, mask, seq_lens)
                 
-                # ★ 역변환
-                bp_orig = bp.cpu().numpy() * bf_std + bf_mu
-                rp_orig = rp.cpu().numpy() * rea_std + rea_mu
-                
-                for j in range(bp.shape[0]):
-                    w = float(batch['weights'][j])
-                    sex = batch['sexes'][j]
-                    
-                    bf_p = float(bp_orig[j])
-                    rea_p = float(rp_orig[j])
-                    
-                    cls_preds = {}
-                    for col in CLASSIFICATION_TARGETS:
-                        cls_preds[col] = cl[col][j].argmax().item()
-                    
-                    windex_p = compute_windex(bf_p, rea_p, w, sex)
-                    wgrade_p = compute_wgrade(windex_p, sex)
-                    quality_p = compute_quality_grade(
-                        cls_preds['INSFAT_GRADE_CLASS'],
-                        cls_preds['YUKSAK_GRADE_CLASS'],
-                        cls_preds['FATSAK_GRADE_CLASS'],
-                        cls_preds['TISSUE_GRADE_CLASS'],
-                        cls_preds['GROWTH_STATUS_CLASS'],
-                    )
-                    last_grade_p = compute_last_grade(quality_p, wgrade_p)
-                    
-                    result = {
-                        'BACKFAT_pred': bf_p,
-                        'REA_pred': rea_p,
-                        'WINDEX_pred': windex_p,
-                        'WGRADE_pred': wgrade_p,
-                        'quality_grade_pred': quality_p,
-                        'LAST_GRADE_pred': last_grade_p,
-                    }
-                    result.update({f'{col}_pred': cls_preds[col] for col in CLASSIFICATION_TARGETS})
-                    test_results.append(result)
+                for col in MAIN_TARGETS:
+                    preds = cls_logits[col].argmax(dim=-1).cpu().numpy()
+                    test_preds[col].extend(preds)
         
-        test_pred_df = pd.DataFrame(test_results)
-        test_pred_df.to_csv('../data/test_predictions.csv', index=False)
-        print(f"  테스트 예측 저장: ../data/test_predictions.csv ({len(test_pred_df)} rows)")
-        print(f"  WGRADE 분포: {dict(test_pred_df['WGRADE_pred'].value_counts())}")
-        print(f"  LAST_GRADE 분포: {dict(test_pred_df['LAST_GRADE_pred'].value_counts().head(10))}")
+        # 결과 DataFrame
+        result_df = pd.DataFrame()
+        result_df['WGRADE'] = [WGRADE_INV[p] for p in test_preds['WGRADE_CLASS']]
+        result_df['QUALITY_GRADE'] = [QUALITY_GRADE_INV[p] for p in test_preds['QUALITY_GRADE_CLASS']]
+        result_df['LAST_GRADE'] = result_df['QUALITY_GRADE'] + result_df['WGRADE']
+        
+        result_df.to_csv('../data/test_predictions_expA.csv', index=False)
+        print(f"\n  테스트 예측 저장: ../data/test_predictions_expA.csv ({len(result_df)} rows)")
+        print(f"\n  WGRADE 분포:\n{result_df['WGRADE'].value_counts().sort_index()}")
+        print(f"\n  QUALITY_GRADE 분포:\n{result_df['QUALITY_GRADE'].value_counts().sort_index()}")
+        print(f"\n  LAST_GRADE 분포:\n{result_df['LAST_GRADE'].value_counts().sort_index()}")
     else:
         print("  테스트 시퀀스 생성 실패")
 else:
@@ -1137,9 +1013,9 @@ else:
 # 섹션 14: 모델 저장
 # =============================================================================
 print("\n[섹션 14] 모델 저장...")
-save_path = 'checkpoints/tft_multitask_model.ckpt'
+save_path = 'checkpoints/tft_expA_model.ckpt'
 trainer.save_checkpoint(save_path)
 print(f"  저장 완료: {save_path}")
 print("\n" + "=" * 70)
-print("파이프라인 완료!")
+print("실험 A 완료!")
 print("=" * 70)

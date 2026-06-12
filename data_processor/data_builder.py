@@ -6,6 +6,10 @@ import pandas as pd
 
 
 """
+    === 라이브러리 버전 ===
+    pandas==1.3.5
+    numpy==1.21.6
+    
     === 실행 방법 ===
     data_builder.py --dataset-type train --save-type parquet
     data_builder.py --dataset-type test --save-type csv
@@ -45,25 +49,24 @@ import pandas as pd
 # 디렉토리 경로 설정
 # ============================================================
 ROOT_DIR = Path(__file__).resolve().parents[1]
-# TRAIN_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_train.csv"
 
 # Main(Train, Test) 데이터 경로
-TRAIN_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_sample" / "sample_hanwoo_train.csv"
-TEST_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_test.csv"
+TRAIN_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_train.csv"
+TEST_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_test.csv"
 
 # 한우 혈통 데이터 경로
-LINEAGE_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_lineage.csv" # 원본 혈통
-LINEAGE_OFFSPRING_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_lineage_offspring.csv" # 년도별 직계 부모의 자식수
-LINEAGE_FARM_OFFSPRING_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_lineage_farm_avg_offspring.csv" # 농가기준 년도별 직계 부모의 자식수 (결측 보간용)
-SLAUGHTER_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_slaughter.csv" # 도축일 기준 이전 평균 한우 등급 (년도, 계절, 나이 고려함)
+LINEAGE_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_lineage.csv" # 원본 혈통
+LINEAGE_OFFSPRING_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_lineage_offspring.csv" # 년도별 직계 부모의 자식수
+LINEAGE_FARM_OFFSPRING_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_lineage_farm_avg_offspring.csv" # 농가기준 년도별 직계 부모의 자식수 (결측 보간용)
+SLAUGHTER_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_slaughter.csv" # 도축일 기준 이전 평균 한우 등급 (년도, 계절, 나이 고려함)
 
 # 한우 농가 데이터 경로
-AREA_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_area_with_avg.csv" # 농가 면적 및 평균 한우 수
-DEATH_DATA_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_death_summary.csv" # 농가별 한우 평균 사망 및 질병
-SAME_FARM_CANDIDATES_PATH = ROOT_DIR / "Data" / "hanwoo_original" / "hanwoo_same_farm_candidates.csv" # 실제로 같은 농가 통합
+AREA_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_area_with_avg.csv" # 농가 면적 및 평균 한우 수
+DEATH_DATA_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_death_summary.csv" # 농가별 한우 평균 사망 및 질병
+SAME_FARM_CANDIDATES_PATH = ROOT_DIR / "data_processor" / "raw_hanwoo_data" / "hanwoo_same_farm_candidates.csv" # 실제로 같은 농가 통합
 
 # 통합된 데이터 출력 경로
-PROCESSED_DATA_DIR = ROOT_DIR / "Data" / "processed"
+PROCESSED_DATA_DIR = ROOT_DIR / "data_processor" / "processed"
 
 
 # ============================================================
